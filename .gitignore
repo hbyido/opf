@@ -1,1 +1,8 @@
-readings/
+readings/*
+opf.code-workspace
+.DS_Store
+data/*
+code/matpower6.0/*
+code/.*
+code/__pycache__*
+*~
