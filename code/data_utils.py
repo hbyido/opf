@@ -11,14 +11,32 @@ class Grid:
         mpc = sio.loadmat(filename)
         key = list(mpc.keys())[3]
         self.version = mpc[key][0][0][0] 
-        self.baseMVA = mpc[key][0][0][1] 
+        self.baseMVA = mpc[key][0][0][1][0][0] 
         self.bus_data = mpc[key][0][0][2] 
         self.gen = mpc[key][0][0][3] 
         self.branch = mpc[key][0][0][4] 
         self.gencost = mpc[key][0][0][5]
         self.num_bus = len(self.bus_data)
-        self.num_branch = len(self.branch)   
+        self.num_branch = len(self.branch)
+
+    def to_dict(self):
+        """ Return MPC object in dict format (for pypower) """
+        
+        return {
+            'version': self.version, 
+            'baseMVA': self.baseMVA,
+            'bus': self.bus_data[:,:13],
+            'gen': self.gen[:,:21], 
+            'branch': self.branch[:,:13], 
+            'areas': np.array([[1, 5]]), 
+            'gencost': self.gencost
+        }   
     
+    def get_pv_voltage(self):
+        """" Return voltage for PV nodes """ 
+        gen_indices = self.gen[:,BUS_I].astype(int) - 1 # indices of generators 
+        return self.bus_data[gen_indices, VM]
+
     def get_voltage_magnitude(self):
         """ return voltage magnitude """
         return self.bus_data[:,VM].reshape(self.num_bus)
@@ -27,16 +45,40 @@ class Grid:
         """ return voltage angles """ 
         return self.bus_data[:, VA].reshape(self.num_bus)
     
-    def get_pg(self):
-        pg = np.zeros(self.num_bus)
-        gen_nums = self.gen[:,BUS_I].astype(int) - 1 # indices of generators 
-        pg[gen_nums] = self.gen[:, PG] / 100.0
+    def get_pd(self):
+        """ Return real power demand """ 
+        return self.bus_data[:,PD]
+    
+    def get_qd(self):
+        """ Return real power demand """ 
+        return self.bus_data[:,QD]
+
+    def get_pg(self, just_gens = True):
+        """ 
+        Return the real power injections.
+        just_gens: if true (default), return just the generators. Otherwise return for all buses, 
+        with 0 for non-generators
+        """
+        if just_gens:
+            return self.gen[:, PG]
+        else:
+            pg = np.zeros(self.num_bus)
+            gen_nums = self.gen[:,BUS_I].astype(int) - 1 # indices of generators 
+            pg[gen_nums] = self.gen[:, PG] 
         return pg
     
-    def get_qg(self):
-        qg = np.zeros(self.num_bus)
-        gen_nums = self.gen[:,BUS_I].astype(int) - 1 # indices of generators 
-        qg[gen_nums] = self.gen[:, QG] / 100.0
+    def get_qg(self, just_gens = True):
+        """ 
+        Return the reactive power injections.
+        just_gens: if true (default), return just the generators. Otherwise return for all buses, 
+        with 0 for non-generators
+        """
+        if just_gens:
+            return self.gen[:, QG]
+        else:
+            qg = np.zeros(self.num_bus)
+            gen_nums = self.gen[:,BUS_I].astype(int) - 1 # indices of generators 
+            qg[gen_nums] = self.gen[:, QG] 
         return qg
     
     def check_voltages(self, voltages):
@@ -46,30 +88,57 @@ class Grid:
                 return False
         return True
     
-    def check_p(self, powers):
+    def get_cost(self):
+        total_cost = 0
+        for i in range(len(self.gen)):
+            pg = self.gen[i, PG]
+            if self.gencost[i, MODEl] != 2:
+                raise(NotImplementedError)
+            terms = self.gencost[i, NCOST+1:][::-1] # reverse order so coefficients correspond to increasing exponents
+            #total_cost += self.gencost[i, STARTUP] Not included in matpower calculation
+            for i in range(len(terms)): 
+                #print("%f*(%f)^%d" % (terms[i], pg, i))
+                total_cost += terms[i]*math.pow(pg, i)
+        return total_cost
+
+    def set_powers(self, pg):
+        self.gen[:, PG] = pg
+
+    def set_voltage(self, voltage):
+        self.gen[:, VG] = voltage        
+    
+    def check_voltage(self):
+        for i in range(self.num_bus):
+            if self.bus_data[i, VM] < self.bus_data[i, Vmin] or self.bus_data[i, VM] > self.bus_data[i, Vmax]:
+                return False
+        return True
+
+    def check_p(self):
         ''' Return true if active power falls within limits ''' 
-        for bus, p in enumerate(powers):
+        for bus, p in enumerate(self.gen[:, PG]):
             if p < self.gen[bus, PMIN] or p > self.gen[bus, PMAX]:
                 return False
         return True
     
-    def check_q(self, powers):
+    def check_q(self):
         ''' Return true if reactive power falls within limits ''' 
-        for bus, q in enumerate(powers):
+        for bus, q in enumerate(self.gen[:, QG]):
             if q < self.gen[bus, QMIN] or q > self.gen[bus, QMAX]:
                 return False
         return True
     
-    def check_angle_diffs(self, angles):
+    def check_angle_diffs(self):
         ''' Check that the angle differences between buses fall within limits. ''' 
         for branch in range(len(self.branch)):
             fbus = int(self.branch[branch, FBUS]) - 1 # Buses are one-indexed
             tbus = int(self.branch[branch, TBUS]) - 1 # Buses are one-indexed 
-            angle_diff = angles[fbus] - angles[tbus]
+            angle_diff = self.bus_data[fbus, VA] - self.bus_data[tbus, VA]
             if angle_diff < self.branch[branch, ANGMIN] or angle_diff > self.branch[branch, ANGMAX]:
                 return False
         return True  
     
+    def check_all_constraints(self):
+        return self.check_p() and self.check_q() and self.check_angle_diffs() and self.check_voltage()
 
     def construct_admittance_matrix(self):
         # The sparse admittance matrix for the grid. This matrix has only N + 2L entries. If there is no connection 
@@ -153,7 +222,6 @@ class Grid:
                 condition = self.check_pv(i, Y, 0.0-pd, 0.0-qd, voltages, angles)
                 print("Bus %d, Succeed: %d " % (i, condition))
         
-
 def set_test_grid():
     filename = "../data/result_1.mat"
     grid = Grid(filename)
@@ -188,9 +256,6 @@ def set_test_grid():
     grid.num_bus = 5
     return grid, voltages, deltas, pg, qg
 
-
-
-
 def main():
     #grid, voltages, deltas, pg, qg = set_test_grid()
     filename = "../data/result_1.mat"
@@ -200,6 +265,8 @@ def main():
     voltages = grid.get_voltage_magnitude()
     deltas = grid.get_voltage_angle()
     grid.check_powers(pg, qg, voltages, deltas)
+    print(grid.get_cost())
+    print(grid.check_all_constraints())
     
 
 if __name__ == "__main__":
